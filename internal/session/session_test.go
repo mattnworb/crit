@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -4801,6 +4803,68 @@ func TestAvailableScopes_NilVCS(t *testing.T) {
 	scopes := availableScopes("main", nil)
 	if len(scopes) != 1 || scopes[0] != "all" {
 		t.Errorf("expected [all] for nil vcs.VCS, got %v", scopes)
+	}
+}
+
+func preserveScopeCache(t *testing.T) {
+	t.Helper()
+	scopeCacheMu.Lock()
+	previousBaseRef := scopeCacheBaseRef
+	previousResult := append([]string(nil), scopeCacheResult...)
+	previousExpiry := scopeCacheExpiry
+	scopeCacheMu.Unlock()
+	t.Cleanup(func() {
+		scopeCacheMu.Lock()
+		scopeCacheBaseRef = previousBaseRef
+		scopeCacheResult = previousResult
+		scopeCacheExpiry = previousExpiry
+		scopeCacheMu.Unlock()
+	})
+}
+
+func TestSeedAvailableScopes(t *testing.T) {
+	preserveScopeCache(t)
+
+	want := []string{"all", "branch", "unstaged"}
+	seedAvailableScopes("base", want)
+	want[1] = "mutated"
+
+	got := cachedAvailableScopes("base", nil)
+	wantCached := []string{"all", "branch", "unstaged"}
+	if !reflect.DeepEqual(got, wantCached) {
+		t.Fatalf("cachedAvailableScopes() = %v, want %v", got, wantCached)
+	}
+}
+
+func TestNewGitSessionReusesInitialScopesThenRefreshes(t *testing.T) {
+	preserveScopeCache(t)
+	dir := initTestRepo(t)
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	writeFile(t, filepath.Join(dir, "staged.go"), "package staged\n")
+	gitT(t, dir, "add", "staged.go")
+	s, err := NewGitSession(&vcs.GitVCS{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, dir, "commit", "-m", "commit staged file")
+
+	if scopes := s.GetSessionInfo().AvailableScopes; !slices.Contains(scopes, "staged") {
+		t.Fatalf("initial scopes = %v, want staged from startup snapshot", scopes)
+	}
+
+	scopeCacheMu.Lock()
+	scopeCacheExpiry = time.Time{}
+	scopeCacheMu.Unlock()
+	if scopes := s.GetSessionInfo().AvailableScopes; slices.Contains(scopes, "staged") {
+		t.Fatalf("refreshed scopes = %v, staged should reflect current Git state", scopes)
 	}
 }
 
